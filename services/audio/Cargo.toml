@@ -1,0 +1,18 @@
+[package]
+name = "audio"
+description = "Audio peripheral interface for Mechanix SDK"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+pipewire = { workspace = true }
+parking_lot = { workspace = true }
+
+[dev-dependencies]
+anyhow = { workspace = true }
+tracing-subscriber = { workspace = true }
