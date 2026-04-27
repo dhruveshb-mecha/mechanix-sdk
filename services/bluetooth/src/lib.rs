@@ -1,13 +1,14 @@
-pub mod adapter;
+mod adapter;
 pub mod agent;
-pub mod bluetooth_manager;
+mod bluetooth_manager;
 mod dbus;
-pub mod device;
-pub mod error;
-pub mod events;
+mod device;
+mod error;
+mod events;
 mod models;
 
 pub use adapter::Adapter;
+pub use agent::{AgentCapability, ConfirmationResponder, PairingRequest, RegisteredAgent};
 pub use bluetooth_manager::BluetoothManager;
 pub use device::Device;
 pub use error::BluetoothError;

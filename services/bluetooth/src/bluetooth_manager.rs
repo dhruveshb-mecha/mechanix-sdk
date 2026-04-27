@@ -1,8 +1,5 @@
 use futures::StreamExt;
-use std::{
-    collections::HashMap,
-    sync::atomic::{AtomicU64, Ordering},
-};
+use std::collections::HashMap;
 use tokio::{
     sync::{broadcast, mpsc},
     time::{Duration, sleep},
@@ -15,10 +12,9 @@ use zbus::{
 };
 
 use crate::{
-    AdapterInfo, DeviceInfo,
+    AdapterInfo, DeviceInfo, RegisteredAgent,
     adapter::Adapter,
-    agent::{AgentCapability, BluezAgent, PairingRequest},
-    dbus::AgentManager1Proxy,
+    agent::{AgentCapability, PairingRequest},
     device::Device,
     error::BluetoothError,
     events::BluetoothEvent,
@@ -30,12 +26,8 @@ const BLUEZ_PATH: &str = "/";
 const IFACE_ADAPTER: &str = "org.bluez.Adapter1";
 const IFACE_DEVICE: &str = "org.bluez.Device1";
 const IFACE_BATTERY: &str = "org.bluez.Battery1";
-const AGENT_ROOT_PATH: &str = "/org/bluez/agents";
-const PAIRING_REQUEST_CHANNEL_CAPACITY: usize = 16;
 const EVENT_RECONNECT_INITIAL_BACKOFF_MS: u64 = 250;
 const EVENT_RECONNECT_MAX_BACKOFF_MS: u64 = 5_000;
-
-static NEXT_AGENT_ID: AtomicU64 = AtomicU64::new(1);
 
 /// The root client for interacting with the BlueZ Bluetooth stack.
 #[derive(Clone)]
@@ -135,65 +127,13 @@ impl BluetoothManager {
         self.event_tx.subscribe()
     }
 
-    /// Registers this application as the Bluetooth pairing agent.
-    pub async fn register_agent(&self) -> Result<mpsc::Receiver<PairingRequest>, BluetoothError> {
-        let (_path, rx) = self
-            .register_agent_with_options(AgentCapability::KeyboardDisplay, true)
-            .await?;
-        Ok(rx)
-    }
-
-    /// Registers a pairing agent and returns both the agent path and request receiver.
-    ///
-    /// Save the returned path and pass it to `unregister_agent` when shutting down.
-    pub async fn register_agent_with_options(
+    /// Registers a pairing agent.
+    pub async fn register_agent(
         &self,
         capability: AgentCapability,
         set_as_default: bool,
-    ) -> Result<(String, mpsc::Receiver<PairingRequest>), BluetoothError> {
-        let (ui_tx, ui_rx) = mpsc::channel(PAIRING_REQUEST_CHANNEL_CAPACITY);
-        let agent = BluezAgent { ui_tx };
-
-        let agent_path = Self::next_agent_path();
-        let path = zbus::zvariant::ObjectPath::try_from(agent_path.as_str())
-            .map_err(|_| BluetoothError::InvalidObjectPath(agent_path.clone()))?;
-
-        self.connection
-            .object_server()
-            .at(agent_path.as_str(), agent)
-            .await?;
-
-        let manager_proxy = AgentManager1Proxy::new(&self.connection).await?;
-
-        manager_proxy
-            .register_agent(&path, capability.as_str())
-            .await?;
-
-        if set_as_default {
-            manager_proxy.request_default_agent(&path).await?;
-        }
-
-        Ok((agent_path, ui_rx))
-    }
-
-    /// Unregisters a previously registered pairing agent.
-    pub async fn unregister_agent(&self, agent_path: &str) -> Result<(), BluetoothError> {
-        let path = zbus::zvariant::ObjectPath::try_from(agent_path)
-            .map_err(|_| BluetoothError::InvalidObjectPath(agent_path.to_string()))?;
-
-        let manager_proxy = AgentManager1Proxy::new(&self.connection).await?;
-
-        manager_proxy.unregister_agent(&path).await?;
-        self.connection
-            .object_server()
-            .remove::<BluezAgent, _>(agent_path)
-            .await?;
-        Ok(())
-    }
-
-    fn next_agent_path() -> String {
-        let id = NEXT_AGENT_ID.fetch_add(1, Ordering::Relaxed);
-        format!("{AGENT_ROOT_PATH}/p{}_{}", std::process::id(), id)
+    ) -> Result<(RegisteredAgent, mpsc::Receiver<PairingRequest>), BluetoothError> {
+        RegisteredAgent::register(self.connection.clone(), capability, set_as_default).await
     }
 
     // ==========================================

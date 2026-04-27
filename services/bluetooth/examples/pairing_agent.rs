@@ -1,23 +1,10 @@
-use std::io::{self, Write};
+use std::io::Write;
+use tokio::io::{AsyncBufReadExt, BufReader};
 
 use bluetooth::{
     BluetoothManager,
     agent::{AgentCapability, PairingRequest},
 };
-
-fn ask_line(prompt: &str) -> io::Result<String> {
-    print!("{prompt}");
-    io::stdout().flush()?;
-
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-    Ok(input.trim().to_string())
-}
-
-fn ask_yes_no(prompt: &str) -> io::Result<bool> {
-    let answer = ask_line(prompt)?;
-    Ok(matches!(answer.to_lowercase().as_str(), "y" | "yes"))
-}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -29,6 +16,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .into_iter()
         .next()
         .ok_or("No Bluetooth adapters found")?;
+
     println!(
         "Using adapter: {} ({})",
         adapter.display_name(),
@@ -39,12 +27,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     adapter.set_discoverable(true).await?;
     adapter.set_pairable(true).await?;
 
-    let (agent_path, mut requests) = bt
-        .register_agent_with_options(AgentCapability::KeyboardDisplay, true)
+    let (agent_guard, mut requests) = bt
+        .register_agent(AgentCapability::KeyboardDisplay, true)
         .await?;
 
-    println!("Pairing agent registered at {agent_path}.");
-    println!("Keep this process running while pairing devices from your UI or shell.");
+    println!("Pairing agent registered successfully.");
+    println!("Keep this process running while pairing devices.");
     println!("Press Ctrl+C to stop.");
 
     loop {
@@ -56,70 +44,96 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
 
                 match req {
-                    PairingRequest::RequestPinCode {
-                        device_address,
-                        reply,
-                    } => {
-                        let prompt = format!("PIN requested for {device_address}. Enter PIN: ");
-                        let pin = ask_line(&prompt).unwrap_or_else(|_| "0000".to_string());
-                        let _ = reply.send(pin);
+                    PairingRequest::RequestPinCode { device_address, responder } => {
+                        print!("PIN requested for {}. Enter PIN: ", device_address);
+                        std::io::stdout().flush().unwrap();
+
+                        let mut stdin = BufReader::new(tokio::io::stdin());
+                        let mut line = String::new();
+
+                        // RACE: Keyboard Input vs. Cancellation Signal
+                        tokio::select! {
+                            _ = stdin.read_line(&mut line) => {
+                                responder.reply(line.trim());
+                            }
+                            cancel_req = requests.recv() => {
+                                if let Some(PairingRequest::Cancel) = cancel_req {
+                                    println!("\n[!] Pairing canceled by remote device.");
+                                }
+                            }
+                        }
                     }
-                    PairingRequest::RequestPasskey {
-                        device_address,
-                        reply,
-                    } => {
-                        let prompt = format!("Passkey requested for {device_address}. Enter numeric passkey: ");
-                        let passkey = ask_line(&prompt)
-                            .ok()
-                            .and_then(|v| v.parse::<u32>().ok())
-                            .unwrap_or(0);
-                        let _ = reply.send(passkey);
+                    PairingRequest::RequestPasskey { device_address, responder } => {
+                        print!("Passkey requested for {}. Enter numeric passkey: ", device_address);
+                        std::io::stdout().flush().unwrap();
+
+                        let mut stdin = BufReader::new(tokio::io::stdin());
+                        let mut line = String::new();
+
+                        tokio::select! {
+                            _ = stdin.read_line(&mut line) => {
+                                if let Ok(passkey) = line.trim().parse::<u32>() {
+                                    responder.reply(passkey);
+                                } else {
+                                    println!("Invalid passkey. Rejecting.");
+                                    responder.reject();
+                                }
+                            }
+                            cancel_req = requests.recv() => {
+                                if let Some(PairingRequest::Cancel) = cancel_req {
+                                    println!("\n[!] Pairing canceled by remote device.");
+                                }
+                            }
+                        }
                     }
-                    PairingRequest::RequestConfirmation {
-                        device_address,
-                        passkey,
-                        reply,
-                    } => {
-                        let prompt = format!(
-                            "Confirm passkey {:06} for {device_address}? [y/N]: ",
-                            passkey
-                        );
-                        let accepted = ask_yes_no(&prompt).unwrap_or(false);
-                        let _ = reply.send(accepted);
+                    PairingRequest::RequestConfirmation { device_address, passkey, responder } => {
+                        print!("Confirm passkey {:06} for {}? [y/N]: ", passkey, device_address);
+                        std::io::stdout().flush().unwrap();
+
+                        let mut stdin = BufReader::new(tokio::io::stdin());
+                        let mut line = String::new();
+
+                        tokio::select! {
+                            _ = stdin.read_line(&mut line) => {
+                                let accepted = matches!(line.trim().to_lowercase().as_str(), "y" | "yes");
+                                println!("{} pairing request.", if accepted { "Accepting" } else { "Rejecting" });
+                                if accepted {
+                                    responder.confirm();
+                                } else {
+                                    responder.reject();
+                                }
+                            }
+                            cancel_req = requests.recv() => {
+                                if let Some(PairingRequest::Cancel) = cancel_req {
+                                    println!("\n[!] Pairing canceled by remote device.");
+                                }
+                            }
+                        }
                     }
-                    PairingRequest::DisplayPinCode {
-                        device_address,
-                        pin_code,
-                    } => {
+                    PairingRequest::DisplayPinCode { device_address, pin_code } => {
                         println!("Display PIN for {}: {}", device_address, pin_code);
                     }
-                    PairingRequest::DisplayPasskey {
-                        device_address,
-                        passkey,
-                        entered,
-                    } => {
+                    PairingRequest::DisplayPasskey { device_address, passkey, entered } => {
                         println!(
                             "Display passkey for {}: {:06} (entered digits: {})",
                             device_address, passkey, entered
                         );
                     }
                     PairingRequest::Cancel => {
-                        println!("Pairing canceled by BlueZ.");
+                        // This catches any stray cancelations that happen outside of active prompts
+                        println!("[!] Pairing canceled by BlueZ.");
                     }
                 }
             }
             _ = tokio::signal::ctrl_c() => {
-                println!("Stopping pairing agent...");
+                println!("\nStopping pairing agent...");
                 break;
             }
         }
     }
 
-    if let Err(err) = bt.unregister_agent(&agent_path).await {
-        eprintln!(
-            "Warning: failed to unregister agent {}: {}",
-            agent_path, err
-        );
+    if let Err(err) = agent_guard.unregister().await {
+        eprintln!("Warning: failed to unregister agent: {}", err);
     }
 
     Ok(())
